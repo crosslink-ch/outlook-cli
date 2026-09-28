@@ -1,0 +1,26 @@
+{
+  "name": "@crosslink-ch/outlook-cli",
+  "version": "0.1.0",
+  "description": "Read-only Microsoft Outlook CLI via Microsoft Graph",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "engines": { "node": ">=20" },
+  "bin": { "outlook": "./dist/cli.js" },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "pnpm build"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^7.0.0",
+    "commander": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

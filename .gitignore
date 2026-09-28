@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+config.json
+cache.json
+*.token
+.DS_Store
