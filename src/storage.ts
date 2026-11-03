@@ -3,13 +3,14 @@ import { constants, type Stats } from 'node:fs';
 import { chmod, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { CliError } from './errors.js';
 
 export function configRoot(): string {
   return join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'outlook-cli');
 }
 
 function filePath(name: string, root: string): string {
-  if (name !== 'config.json' && name !== 'cache.json') throw new Error('Invalid credential filename');
+  if (name !== 'config.json' && name !== 'cache.json' && !/^cache-[0-9a-f-]{36}\.json$/.test(name)) throw new Error('Invalid credential filename');
   return join(root, name);
 }
 
@@ -63,4 +64,19 @@ export async function removePrivate(name: string, root = configRoot()): Promise<
   if (!stat) return;
   if (!safe(stat)) throw new Error('Unsafe credential file: refusing removal');
   await unlink(path);
+}
+
+// Short lock only around compare-and-swap, never across authentication/network I/O.
+// An interrupted process may leave .config.lock: fail closed rather than guessing it is stale.
+export async function replaceConfig(expected: string | undefined, data: string | undefined, root: string): Promise<void> {
+  await ensureRoot(root);
+  const lock = join(root, '.config.lock');
+  let handle;
+  try { handle = await open(lock, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
+  catch { throw new CliError('CONFIG_BUSY', 'Another credential update holds the config lock; retry after it finishes'); }
+  try {
+    if (await readPrivate('config.json', root) !== expected) throw new CliError('CONCURRENT_AUTH_CHANGE', 'Authentication configuration changed during verification; retry without switching modes');
+    if (data === undefined) await removePrivate('config.json', root);
+    else await writePrivate('config.json', data, root);
+  } finally { await handle.close(); await unlink(lock); }
 }
