@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 *.log
 .env
@@ -7,3 +7,6 @@ config.json
 cache.json
 *.token
 .DS_Store
+.scratch/
+cache-*.json
+.config.lock

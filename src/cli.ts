@@ -1,9 +1,4 @@
 #!/usr/bin/env node
-import { createProgram } from './program.js';
+import { run } from './program.js';
 
-try {
-  await createProgram().parseAsync(process.argv);
-} catch (error) {
-  console.error(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
-  process.exitCode = 1;
-}
+process.exitCode = await run(process.argv.slice(2));

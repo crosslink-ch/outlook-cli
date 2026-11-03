@@ -1,13 +1,13 @@
 {
   "name": "@crosslink-ch/outlook-cli",
-  "version": "0.1.0",
-  "description": "Read-only Microsoft Outlook CLI via Microsoft Graph",
+  "version": "0.2.0",
+  "description": "Mode-aware Outlook mail and calendar CLI via Microsoft Graph",
   "type": "module",
   "license": "MIT",
   "private": false,
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22" },
   "bin": { "outlook": "./dist/cli.js" },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": ["dist", "README.md", "AGENTS.md", "LICENSE"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
