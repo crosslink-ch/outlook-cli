@@ -187,7 +187,8 @@ function rejected(error: unknown): boolean {
 }
 
 export class GraphClient {
-  constructor(private readonly token: string, private readonly transport: typeof fetch = fetch, private readonly grant?: Grant) {}
+  constructor(private readonly token: string, private readonly transport: typeof fetch = fetch, private readonly grant?: Grant,
+    private readonly sleep: (ms: number) => Promise<void> = ms => new Promise(resolve => setTimeout(resolve, ms))) {}
 
   async createEvent(input: EventInput, calendar?: string) {
     requireOperation(this.grant, 'calendar.create');
@@ -319,12 +320,19 @@ export class GraphClient {
     try {
       await this.request(new URL(`${GRAPH_ROOT}/me/messages/${encodedId(id)}/send`), { method: 'POST', ignoreBody: true });
       acknowledged = true;
-      let after: Draft | undefined;
-      try { after = await this.draft(id); }
-      catch (error) { if (!(error instanceof CliError && error.code === 'GRAPH_ERROR' && error.details?.status === 404)) throw error; }
-      // Gone from its draft ID, or the same (immutable) ID now reads as a sent message.
-      if (after !== undefined && (after?.id !== id || after.isDraft !== false)) throw new Error('Message still reads as a draft');
-      return { outcome: 'sent' as const, id, verified: true, subject: before.subject ?? '', recipients };
+      // Exchange accepts the send (202) before the draft leaves its folder, so the first readback often still
+      // shows it. Only the read is repeated; the POST above is never sent twice.
+      for (const wait of [0, 500, 1000, 1500, 2000, 3000]) {
+        if (wait) await this.sleep(wait);
+        let after: Draft | undefined;
+        try { after = await this.draft(id); }
+        catch (error) { if (!(error instanceof CliError && error.code === 'GRAPH_ERROR' && error.details?.status === 404)) throw error; }
+        if (after !== undefined && after?.id !== id) throw new Error('Wrong message identity');
+        // Gone from its draft ID, or the same (immutable) ID now reads as a sent message.
+        if (after === undefined || after.isDraft === false) return { outcome: 'sent' as const, id, verified: true, subject: before.subject ?? '', recipients };
+        if (after.isDraft !== true) throw new Error('Cannot establish draft state');
+      }
+      throw new Error('Message still reads as a draft');
     } catch (error) {
       if (!acknowledged && rejected(error)) throw error;
       throw new CliError('MUTATION_UNVERIFIED', 'Sending was not verified; check Sent Items before doing anything else and never resend automatically', { id, outcome: acknowledged ? 'sent_but_unverified' : 'outcome_unknown' });

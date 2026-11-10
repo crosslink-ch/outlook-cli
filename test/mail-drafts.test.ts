@@ -257,6 +257,20 @@ test('draft send is also verified when the same ID reads back as a sent message 
   assert.deepEqual(methods, ['GET', 'POST', 'GET']);
 });
 
+test('draft send keeps reading back while Exchange still shows the draft, then verifies once it is gone; one POST only', async () => {
+  const methods: string[] = [];
+  const waits: number[] = [];
+  const graph = new GraphClient('token', async (_url, init) => {
+    methods.push(init!.method!);
+    if (init?.method === 'POST') return new Response(null, { status: 202 });
+    if (methods.length <= 4) return Response.json(draft);
+    return Response.json({}, { status: 404 });
+  }, grant, async ms => { waits.push(ms); });
+  assert.deepEqual(await graph.sendDraft('draft/1'), SENT);
+  assert.deepEqual(methods, ['GET', 'POST', 'GET', 'GET', 'GET']);
+  assert.equal(waits.length, 2);
+});
+
 test('localhost contract: send is refused with only the preflight GET for non-drafts and drafts without recipients', async t => {
   let current: any;
   const { requests, graph } = await recorder(t, (_req, res) => { res.end(JSON.stringify(current)); });
@@ -313,14 +327,14 @@ test('send failures separate not-sent, unknown and acknowledged-but-unverified o
       if (failure === 'readback wrong id') return Response.json({ id: 'other', isDraft: false });
       if (failure.startsWith('readback ')) return Response.json({ error: 'PRIVATE-TOKEN' }, { status: Number(failure.slice(9)) });
       return Response.json(draft);
-    }, grant);
+    }, grant, async () => {});
     await assert.rejects(graph.sendDraft('draft/1'), (error: any) => {
       if (expected === 'GRAPH_ERROR') assert.deepEqual([error.code, error.details], ['GRAPH_ERROR', { status: Number(failure.slice(5)) }], failure);
       else assert.deepEqual([error.code, error.details], ['MUTATION_UNVERIFIED', { id: 'draft/1', outcome: expected }], failure);
       assert.doesNotMatch(JSON.stringify(error) + String(error), /PRIVATE-TOKEN/);
       return true;
     });
-    assert.deepEqual(methods, failure.startsWith('post') ? ['GET', 'POST'] : ['GET', 'POST', 'GET'], failure);
+    assert.deepEqual(methods, failure.startsWith('post') ? ['GET', 'POST'] : failure === 'still draft' ? ['GET', 'POST', 'GET', 'GET', 'GET', 'GET', 'GET', 'GET'] : ['GET', 'POST', 'GET'], failure);
   }
 });
 
