@@ -57,7 +57,7 @@ test('mode login requests the configured app scopes and atomically saves isolate
   assert.equal(second.connections['read-write'].clientId, rwId.clientId);
   assert.notEqual(second.connections['read-write'].cacheFile, ro.cacheFile);
   assert.equal(await readPrivate(ro.cacheFile, root), JSON.stringify({ client: roId.clientId, account, credential: 'new-private-cache' }));
-  assert.deepEqual(f.requests[1].req.scopes, ['User.Read', 'Mail.Read', 'Calendars.ReadWrite']);
+  assert.deepEqual(f.requests[1].req.scopes, ['User.Read', 'Mail.Read', 'Calendars.ReadWrite', 'Mail.ReadWrite', 'Mail.Send']);
   assert.equal((await lstat(root)).mode & 0o777, 0o700);
   assert.equal((await lstat(join(root, second.connections['read-write'].cacheFile))).mode & 0o777, 0o600);
 });

@@ -8,7 +8,10 @@ import { GraphClient } from './graph.js';
 import { configRoot, readPrivate, removePrivate, replaceConfig, writePrivate } from './storage.js';
 
 const SCOPES = ['User.Read', 'Mail.Read'];
-const MODE_SCOPES: Record<Mode, string[]> = { 'read-only': SCOPES, 'read-write': [...SCOPES, 'Calendars.ReadWrite'] };
+// REQUIRED_SCOPES is the minimum for a valid connection in a mode. MODE_SCOPES is what sign-in asks for:
+// read-write additionally requests optional mail-write scopes, whose absence only hides the draft operations.
+const REQUIRED_SCOPES: Record<Mode, string[]> = { 'read-only': SCOPES, 'read-write': [...SCOPES, 'Calendars.ReadWrite'] };
+const MODE_SCOPES: Record<Mode, string[]> = { 'read-only': SCOPES, 'read-write': [...REQUIRED_SCOPES['read-write'], 'Mail.ReadWrite', 'Mail.Send'] };
 
 interface Connection extends SavedIdentity { cacheFile: string; username: string; meId: string }
 interface State {
@@ -77,10 +80,20 @@ export class AuthManager {
     if (result.tenantId?.toLowerCase() !== identity.tenantId.toLowerCase() || result.account.tenantId?.toLowerCase() !== identity.tenantId.toLowerCase()) {
       throw new CliError('IDENTITY_MISMATCH', 'Microsoft returned a different tenant');
     }
-    if (!Array.isArray(result.scopes) || MODE_SCOPES[mode].some(scope => !hasScope(result.scopes, scope))) {
+    if (!Array.isArray(result.scopes) || REQUIRED_SCOPES[mode].some(scope => !hasScope(result.scopes, scope))) {
       throw new CliError('INSUFFICIENT_SCOPE', 'Microsoft did not grant all required permissions for this mode');
     }
     return { mode, scopes: result.scopes, expiresAt: result.expiresOn.getTime() };
+  }
+
+  // Connections authorized before the optional scopes existed (or without consent for them) cannot silently
+  // acquire the full set; they stay valid on the required minimum instead of forcing a new login.
+  private async silent(app: AuthApp, account: AccountInfo, mode: Mode): Promise<AuthenticationResult | null> {
+    try { return await app.acquireTokenSilent({ account, scopes: MODE_SCOPES[mode] }); }
+    catch (error) {
+      if (MODE_SCOPES[mode].length === REQUIRED_SCOPES[mode].length) throw error;
+      return app.acquireTokenSilent({ account, scopes: REQUIRED_SCOPES[mode] });
+    }
   }
 
   private async verify(result: AuthenticationResult | null, identity: Identity, mode: Mode) {
@@ -140,7 +153,7 @@ export class AuthManager {
       app.getTokenCache().deserialize(data);
       cacheBefore = app.getTokenCache().serialize();
       const account = chooseAccount(await app.getTokenCache().getAllAccounts(), identity.homeAccountId);
-      result = await app.acquireTokenSilent({ account, scopes: MODE_SCOPES[mode] });
+      result = await this.silent(app, account, mode);
     } catch { throw new CliError('AUTH_REQUIRED', 'Microsoft session expired or revoked; run outlook auth login again'); }
     const verified = await this.verify(result, identity, mode);
     if (result!.account!.homeAccountId !== identity.homeAccountId || (identity.meId && verified.me.id !== identity.meId)) {
@@ -193,7 +206,7 @@ export class AuthManager {
       app.getTokenCache().deserialize(await readFile(source, 'utf8'));
       const accounts = await app.getTokenCache().getAllAccounts();
       if (accounts.length !== 1) throw new CliError('INVALID_CACHE', 'Source cache must contain exactly one signed-in account');
-      result = await app.acquireTokenSilent({ account: accounts[0]!, scopes: MODE_SCOPES[mode] });
+      result = await this.silent(app, accounts[0]!, mode);
     } catch (error) {
       if (error instanceof CliError) throw error;
       throw new CliError('AUTH_REQUIRED', 'Source cache cannot acquire a valid token for this application');

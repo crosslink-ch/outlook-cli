@@ -104,6 +104,88 @@ function mutationFailure(error: unknown, acknowledged: boolean, action: 'updated
   return new CliError('MUTATION_UNVERIFIED', 'Mutation was not verified; inspect the event before retrying', { id, calendar, outcome: acknowledged ? `${action}_but_unverified` : 'outcome_unknown' });
 }
 
+const DRAFT_FIELDS = 'id,subject,isDraft,toRecipients,ccRecipients,bccRecipients,bodyPreview,webLink,conversationId,parentFolderId';
+const RECIPIENT_FIELDS = { to: 'toRecipients', cc: 'ccRecipients', bcc: 'bccRecipients' } as const;
+const RECIPIENT_KEYS = ['to', 'cc', 'bcc'] as const;
+// One plain addr-spec only: no display names, lists, quoting, whitespace or control characters.
+const ADDRESS = /^[^\s@<>()[\]\\,;:"\x00-\x1f\x7f]+@[^\s@<>()[\]\\,;:"\x00-\x1f\x7f]+\.[^\s@<>()[\]\\,;:"\x00-\x1f\x7f.]+$/;
+
+export interface Recipient { emailAddress?: { address?: string; name?: string } }
+export interface Draft {
+  id: string;
+  subject?: string | null;
+  isDraft?: boolean;
+  toRecipients?: Recipient[];
+  ccRecipients?: Recipient[];
+  bccRecipients?: Recipient[];
+  bodyPreview?: string;
+  webLink?: string;
+  conversationId?: string;
+  parentFolderId?: string;
+}
+export interface DraftInput { to: string[]; cc?: string[]; bcc?: string[]; subject: string; body: string; html?: boolean }
+export interface ReplyInput { all?: boolean; body: string; html?: boolean }
+type DraftBody = { subject?: string; body?: { contentType: 'text' | 'html'; content: string } } & Partial<Record<typeof RECIPIENT_FIELDS[keyof typeof RECIPIENT_FIELDS], Recipient[]>>;
+
+function checkBody(body: unknown): void {
+  if (typeof body !== 'string' || body.length > 1_000_000) throw new CliError('INVALID_INPUT', 'Body must be text of at most 1,000,000 characters');
+}
+function addresses(list: unknown): string[] {
+  return (Array.isArray(list) ? list : []).map(item => item?.emailAddress?.address).filter(address => typeof address === 'string');
+}
+function sameAddresses(actual: unknown, expected: unknown): boolean {
+  const key = (list: unknown) => [...new Set(addresses(list).map(address => address.toLowerCase()))].sort().join('\n');
+  return key(actual) === key(expected);
+}
+
+function draftBody(input: Partial<DraftInput>, create = false): DraftBody {
+  const invalid = (message: string) => new CliError('INVALID_INPUT', message);
+  if (!input || typeof input !== 'object' || Object.keys(input).some(key => !['to', 'cc', 'bcc', 'subject', 'body', 'html'].includes(key))) {
+    throw invalid('Only named draft fields are supported; attachments are not supported');
+  }
+  let recipients = 0;
+  for (const key of RECIPIENT_KEYS) {
+    const list = input[key];
+    if (list === undefined) continue;
+    if (!Array.isArray(list) || list.some(address => typeof address !== 'string' || address.length > 254 || !ADDRESS.test(address))) {
+      throw invalid(`Each --${key} recipient must be one plain email address, such as person@example.com`);
+    }
+    recipients += list.length;
+  }
+  if (recipients > 100) throw invalid('At most 100 recipients are supported');
+  if (create && !input.to?.length) throw invalid('At least one --to recipient is required');
+  if ((create || input.subject !== undefined) && (typeof input.subject !== 'string' || input.subject.length > 255 || /[\r\n]/.test(input.subject))) {
+    throw invalid('Subject must be a single line of at most 255 characters');
+  }
+  if (create || input.body !== undefined) checkBody(input.body);
+  if (input.html !== undefined && typeof input.html !== 'boolean') throw invalid('html must be a boolean');
+  if (input.html && input.body === undefined) throw invalid('--html requires a body');
+  const body: DraftBody = {
+    ...(input.subject !== undefined ? { subject: input.subject } : {}),
+    ...(input.body !== undefined ? { body: { contentType: input.html ? 'html' as const : 'text' as const, content: input.body } } : {}),
+  };
+  for (const key of RECIPIENT_KEYS) {
+    const list = input[key] ?? (create ? [] : undefined);
+    if (list) body[RECIPIENT_FIELDS[key]] = list.map(address => ({ emailAddress: { address } }));
+  }
+  if (!Object.keys(body).length) throw invalid('At least one draft field is required');
+  return body;
+}
+
+// Bodies are not compared: Exchange rewrites stored content, so equality would report false failures.
+function verifyDraft(draft: Draft, id: string, expected: DraftBody = {}): void {
+  if (!draft || draft.id !== id) throw new Error('Wrong draft identity');
+  if (draft.isDraft !== true) throw new Error('Not a draft');
+  if (expected.subject !== undefined && (draft.subject ?? '').trim() !== expected.subject.trim()) throw new Error('Subject mismatch');
+  for (const field of Object.values(RECIPIENT_FIELDS)) {
+    if (expected[field] && !sameAddresses(draft[field], expected[field])) throw new Error('Recipient mismatch');
+  }
+}
+
+function rejected(error: unknown): boolean {
+  return error instanceof CliError && error.code === 'GRAPH_ERROR' && Number(error.details?.status) < 500;
+}
+
 export class GraphClient {
   constructor(private readonly token: string, private readonly transport: typeof fetch = fetch, private readonly grant?: Grant) {}
 
@@ -162,6 +244,91 @@ export class GraphClient {
       }
       throw new Error('Deleted event still exists');
     } catch (error) { throw mutationFailure(error, acknowledged, 'deleted', id, options.calendar); }
+  }
+
+  private draft(id: string): Promise<Draft> {
+    const url = new URL(`${GRAPH_ROOT}/me/messages/${encodedId(id)}`);
+    url.searchParams.set('$select', DRAFT_FIELDS);
+    return this.request(url);
+  }
+
+  // One non-idempotent POST that creates a draft, then a readback of the ID Graph returned.
+  private async postDraft(url: URL, body: unknown, expected?: DraftBody) {
+    let id: string | undefined;
+    try {
+      const created = await this.request<Draft>(url, { method: 'POST', body });
+      if (typeof created?.id !== 'string' || !created.id) throw new Error('Missing created ID');
+      id = created.id;
+      const draft = await this.draft(id);
+      verifyDraft(draft, id, expected);
+      return { outcome: 'created' as const, id, draft };
+    } catch (error) {
+      if (!id && rejected(error)) throw error;
+      throw new CliError('MUTATION_UNVERIFIED', 'Draft creation was not verified; inspect the Drafts folder before retrying', { outcome: id ? 'created_but_unverified' : 'outcome_unknown', ...(id ? { id } : {}) });
+    }
+  }
+
+  async createDraft(input: DraftInput) {
+    requireOperation(this.grant, 'draft.create');
+    const body = draftBody(input, true);
+    return this.postDraft(new URL(`${GRAPH_ROOT}/me/messages`), body, body);
+  }
+
+  // Graph chooses the recipients and quotes the original; the comment is plain text only.
+  async createReplyDraft(messageId: string, input: ReplyInput) {
+    requireOperation(this.grant, 'draft.reply');
+    if (!input || typeof input !== 'object' || Object.keys(input).some(key => !['all', 'body', 'html'].includes(key)) || (input.all !== undefined && typeof input.all !== 'boolean')) {
+      throw new CliError('INVALID_INPUT', 'Reply drafts accept only a message ID, a plain-text body and the reply-all choice');
+    }
+    if (input.html) throw new CliError('INVALID_INPUT', 'Reply drafts support a plain-text body only; --html is not supported for replies');
+    checkBody(input.body);
+    return this.postDraft(new URL(`${GRAPH_ROOT}/me/messages/${encodedId(messageId)}/${input.all ? 'createReplyAll' : 'createReply'}`), { comment: input.body });
+  }
+
+  private async draftPreflight(id: string, action: string): Promise<Draft> {
+    const draft = await this.draft(id);
+    if (!draft || draft.id !== id) throw new CliError('INVALID_RESPONSE', `Cannot establish message identity; nothing was ${action}`);
+    if (draft.isDraft !== true) throw new CliError('NOT_A_DRAFT', `Message is not a draft; nothing was ${action}`, { id });
+    return draft;
+  }
+
+  async updateDraft(id: string, input: Partial<DraftInput>) {
+    requireOperation(this.grant, 'draft.update');
+    const body = draftBody(input);
+    await this.draftPreflight(id, 'changed');
+    let acknowledged = false;
+    try {
+      await this.request(new URL(`${GRAPH_ROOT}/me/messages/${encodedId(id)}`), { method: 'PATCH', body, ignoreBody: true });
+      acknowledged = true;
+      const draft = await this.draft(id);
+      verifyDraft(draft, id, body);
+      return { outcome: 'updated' as const, id, draft };
+    } catch (error) {
+      if (!acknowledged && rejected(error)) throw error;
+      throw new CliError('MUTATION_UNVERIFIED', 'Draft update was not verified; inspect the draft before retrying', { id, outcome: acknowledged ? 'updated_but_unverified' : 'outcome_unknown' });
+    }
+  }
+
+  // Sending is only ever the release of an existing draft; the single POST is never repeated.
+  async sendDraft(id: string) {
+    requireOperation(this.grant, 'draft.send');
+    const before = await this.draftPreflight(id, 'sent');
+    const recipients = { to: addresses(before.toRecipients), cc: addresses(before.ccRecipients), bcc: addresses(before.bccRecipients) };
+    if (!recipients.to.length && !recipients.cc.length && !recipients.bcc.length) throw new CliError('INVALID_INPUT', 'Draft has no recipients; nothing was sent', { id });
+    let acknowledged = false;
+    try {
+      await this.request(new URL(`${GRAPH_ROOT}/me/messages/${encodedId(id)}/send`), { method: 'POST', ignoreBody: true });
+      acknowledged = true;
+      let after: Draft | undefined;
+      try { after = await this.draft(id); }
+      catch (error) { if (!(error instanceof CliError && error.code === 'GRAPH_ERROR' && error.details?.status === 404)) throw error; }
+      // Gone from its draft ID, or the same (immutable) ID now reads as a sent message.
+      if (after !== undefined && (after?.id !== id || after.isDraft !== false)) throw new Error('Message still reads as a draft');
+      return { outcome: 'sent' as const, id, verified: true, subject: before.subject ?? '', recipients };
+    } catch (error) {
+      if (!acknowledged && rejected(error)) throw error;
+      throw new CliError('MUTATION_UNVERIFIED', 'Sending was not verified; check Sent Items before doing anything else and never resend automatically', { id, outcome: acknowledged ? 'sent_but_unverified' : 'outcome_unknown' });
+    }
   }
 
   async calendars(limit = 100): Promise<Calendar[]> {

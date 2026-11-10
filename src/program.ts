@@ -1,8 +1,9 @@
 import { Command, CommanderError, InvalidArgumentError } from 'commander';
+import { open, stat } from 'node:fs/promises';
 import { AuthManager, parseIdentity, parseMode, type Identity } from './auth.js';
 import { availableOperations, requireOperation, type Operation } from './capabilities.js';
 import { CliError } from './errors.js';
-import type { EventInput, MessageDetail, MessageSummary } from './graph.js';
+import type { Draft, DraftInput, EventInput, MessageDetail, MessageSummary, Recipient } from './graph.js';
 
 type Session = Awaited<ReturnType<AuthManager['connection']>>;
 export interface IO { out(text: string): void; err(text: string): void }
@@ -29,6 +30,40 @@ function optionalIdentity(opts: { clientId?: string; tenantId?: string }): Ident
 function fields(opts: Partial<EventInput>): Partial<EventInput> {
   return Object.fromEntries(['title', 'start', 'end', 'timezone', 'location', 'description'].filter(key => opts[key as keyof EventInput] !== undefined).map(key => [key, opts[key as keyof EventInput]]));
 }
+// Repeatable and comma-separated; an empty value yields an empty list (clears that field on update).
+function recipientArg(value: string, previous: string[] = []): string[] {
+  return [...previous, ...value.split(',').map(item => item.trim()).filter(Boolean)];
+}
+const MAX_BODY_FILE = 1_048_576;
+async function bodyArg(opts: { body?: string; bodyFile?: string }, required: boolean): Promise<string | undefined> {
+  if (opts.body !== undefined && opts.bodyFile !== undefined) throw new CliError('INVALID_INPUT', 'Supply only one of --body and --body-file');
+  if (opts.bodyFile === undefined) {
+    if (required && opts.body === undefined) throw new CliError('INVALID_INPUT', 'Supply exactly one of --body and --body-file');
+    return opts.body;
+  }
+  const invalid = new CliError('INVALID_INPUT', '--body-file must be a readable UTF-8 regular file of at most 1 MB');
+  let handle;
+  // Check the type before opening: opening a FIFO or device could block indefinitely.
+  try { if (!(await stat(opts.bodyFile)).isFile()) throw invalid; handle = await open(opts.bodyFile, 'r'); } catch { throw invalid; }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > MAX_BODY_FILE) throw invalid;
+    const data = await handle.readFile();
+    if (data.length > MAX_BODY_FILE) throw invalid;
+    return new TextDecoder('utf-8', { fatal: true }).decode(data);
+  } catch { throw invalid; } finally { await handle.close(); }
+}
+function draftFields(opts: Partial<DraftInput>, body: string | undefined): Partial<DraftInput> {
+  const input: Partial<DraftInput> = { ...opts, body };
+  return Object.fromEntries((['to', 'cc', 'bcc', 'subject', 'body', 'html'] as const).filter(key => input[key] !== undefined).map(key => [key, input[key]]));
+}
+function draftText(result: { outcome: string; id: string; draft?: Draft; subject?: string | null; recipients?: Record<'to' | 'cc' | 'bcc', string[]> }): string {
+  const list = (items?: Recipient[]) => (items ?? []).map(item => item.emailAddress?.address ?? '');
+  const d = result.draft;
+  const recipients = result.recipients ?? { to: list(d?.toRecipients), cc: list(d?.ccRecipients), bcc: list(d?.bccRecipients) };
+  return [`Draft ${result.outcome}: id=${result.id}`, `To: ${compact(recipients.to.join(', '))}`, `Cc: ${compact(recipients.cc.join(', '))}`, `Bcc: ${compact(recipients.bcc.join(', '))}`,
+    `Subject: ${compact((d ? d.subject : result.subject) ?? '')}`, ...(d?.bodyPreview ? [`Preview: ${compact(d.bodyPreview)}`] : [])].join('\n');
+}
 function report(session: Session | undefined, error?: CliError) {
   if (!session) return { signedIn: false, operations: [], error: { code: error?.code ?? 'AUTH_REQUIRED', message: error?.message ?? 'Not signed in; run outlook auth login' } };
   const { grant, identity, me } = session;
@@ -42,8 +77,8 @@ export function createProgram(options: ProgramOptions = {}): Command {
   const io = options.io ?? defaultIO;
   const session = options.session;
   const program = new Command().name('outlook')
-    .description('Outlook mail and calendar CLI: authenticated read-only / read-write modes')
-    .version('0.2.0').option('--json', 'Output JSON; existing mail/auth commands retain their raw success format').exitOverride();
+    .description('Outlook mail, draft and calendar CLI: authenticated read-only / read-write modes')
+    .version('0.3.0').option('--json', 'Output JSON; existing mail/auth commands retain their raw success format').exitOverride();
   program.configureOutput({ writeOut: text => io.out(text), writeErr: () => {}, outputError: () => {} });
   const emit = (value: unknown, human?: string) => {
     // Preserve the machine contract consumed by existing mail automation.
@@ -110,19 +145,23 @@ export function createProgram(options: ProgramOptions = {}): Command {
   program.command('read').description('Read a message text body without changing read/unread status').argument('<id>', 'Message ID')
     .action(async id => { const value = await graph('read').read(id); emit(value, detail(value)); });
 
-  const calendar = program.command('calendar').description('Calendar operations available to the currently verified connection');
   const available = availableOperations(session?.grant);
-  const calendarCommand = (name: string, description: string) => {
-    const operation = `calendar.${name}` as Operation;
-    const cmd = calendar.command(name, { hidden: !available.includes(operation) }).description(description);
-    const help = cmd.helpInformation.bind(cmd);
-    cmd.helpInformation = () => { requireOperation(session?.grant, operation); return help(); };
-    return cmd;
+  // One registry drives both discovery and enforcement: ungranted verbs are hidden and refuse before any option parsing.
+  const guardedGroup = (name: 'calendar' | 'draft', description: string) => {
+    const group = program.command(name).description(description);
+    group.hook('preSubcommand', (_parent, cmd) => {
+      if (cmd.name() !== 'help') requireOperation(session?.grant, `${name}.${cmd.name()}` as Operation);
+    });
+    group.addHelpText('after', session ? `\nActive mode: ${session.grant.mode}. Use outlook capabilities --json for exact permissions.\n` : '\nNo verified connection. Use outlook auth login, then outlook capabilities --json.\n');
+    return (verb: string, text: string) => {
+      const operation = `${name}.${verb}` as Operation;
+      const cmd = group.command(verb, { hidden: !available.includes(operation) }).description(text);
+      const help = cmd.helpInformation.bind(cmd);
+      cmd.helpInformation = () => { requireOperation(session?.grant, operation); return help(); };
+      return cmd;
+    };
   };
-  calendar.hook('preSubcommand', (_parent, cmd) => {
-    if (cmd.name() !== 'help') requireOperation(session?.grant, `calendar.${cmd.name()}` as Operation);
-  });
-  calendar.addHelpText('after', session ? `\nActive mode: ${session.grant.mode}. Use outlook capabilities --json for exact permissions.\n` : '\nNo verified connection. Use outlook auth login, then outlook capabilities --json.\n');
+  const calendarCommand = guardedGroup('calendar', 'Calendar operations available to the currently verified connection');
   calendarCommand('list', 'List calendars (bounded to 1–100)')
     .option('--limit <count>', 'Maximum calendars', limitArg, 100)
     .action(async opts => emit(await graph('calendar.list').calendars(opts.limit)));
@@ -154,7 +193,40 @@ export function createProgram(options: ProgramOptions = {}): Command {
     .option('--event <id>', 'Event ID').option('--calendar <id>', 'Calendar ID')
     .option('--notify-attendees', 'Explicitly approve possible meeting cancellation notifications')
     .action(async opts => emit(await graph('calendar.delete').deleteEvent(opts.event, { calendar: opts.calendar, notifyAttendees: opts.notifyAttendees })));
-  program.addHelpText('after', '\nStart with outlook auth status --json and outlook capabilities --json.\nHelp only advertises calendar operations granted to the verified active connection.\nModes are selected during authentication, never by a flag on an operation.\n');
+
+  const draftCommand = guardedGroup('draft', 'Mail draft operations available to the currently verified connection');
+  const recipientOptions = (cmd: Command) => cmd
+    .option('--to <address>', 'Recipient address; repeatable or comma-separated', recipientArg)
+    .option('--cc <address>', 'Cc address; repeatable or comma-separated', recipientArg)
+    .option('--bcc <address>', 'Bcc address; repeatable or comma-separated', recipientArg);
+  const bodyOptions = (cmd: Command) => cmd
+    .option('--body <text>', 'Body text')
+    .option('--body-file <path>', 'Read the body from a UTF-8 file (max 1 MB) instead of --body');
+  bodyOptions(recipientOptions(draftCommand('create', 'Create a new mail draft (nothing is sent) and verify by readback')).option('--subject <text>', 'Subject, single line'))
+    .option('--html', 'Treat the body as HTML instead of plain text')
+    .action(async opts => {
+      const client = graph('draft.create');
+      const result = await client.createDraft(draftFields(opts, await bodyArg(opts, true)) as DraftInput);
+      emit(result, draftText(result));
+    });
+  bodyOptions(draftCommand('reply', 'Create a reply draft to a message (nothing is sent); Graph chooses the recipients')
+    .option('--message <id>', 'ID of the message to reply to').option('--all', 'Reply to all recipients'))
+    .action(async opts => {
+      const client = graph('draft.reply');
+      const result = await client.createReplyDraft(opts.message, { all: Boolean(opts.all), body: (await bodyArg(opts, true))! });
+      emit(result, draftText(result));
+    });
+  bodyOptions(recipientOptions(draftCommand('update', 'Replace named fields of an existing draft and verify by readback').option('--draft <id>', 'Draft ID')).option('--subject <text>', 'Subject, single line'))
+    .option('--html', 'Treat the body as HTML instead of plain text')
+    .action(async opts => {
+      const client = graph('draft.update');
+      const result = await client.updateDraft(opts.draft, draftFields(opts, await bodyArg(opts, false)));
+      emit(result, draftText(result));
+    });
+  draftCommand('send', 'Send one existing draft by ID; only after the user approved that exact email. Never retried')
+    .option('--draft <id>', 'Draft ID')
+    .action(async opts => { const result = await graph('draft.send').sendDraft(opts.draft); emit(result, draftText(result)); });
+  program.addHelpText('after', '\nStart with outlook auth status --json and outlook capabilities --json.\nHelp only advertises calendar and draft operations granted to the verified active connection.\nModes are selected during authentication, never by a flag on an operation.\n');
   return program;
 }
 
