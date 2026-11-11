@@ -138,8 +138,22 @@ test('localhost contract: reply and reply-all POST a plain-text comment once and
     'POST /v1.0/me/messages/msg%2F1/createReply', `GET /v1.0/me/messages/reply-draft${SELECT}`,
     'POST /v1.0/me/messages/msg%2F1/createReplyAll', `GET /v1.0/me/messages/reply-all-draft${SELECT}`,
   ]);
-  assert.equal(requests[0].body, '{"comment":"Thanks"}');
-  assert.equal(requests[2].body, '{"comment":"Thanks all"}');
+  assert.equal(requests[0].body, '{"comment":"<div>Thanks</div>"}');
+  assert.equal(requests[2].body, '{"comment":"<div>Thanks all</div>"}');
+});
+
+// Graph inserts the createReply comment into the HTML body as markup, so plain text has to be converted.
+test('reply drafts keep paragraph spacing and literal characters of the plain-text body', async t => {
+  const { requests, graph } = await recorder(t, (req, res) => {
+    const stored = { id: 'reply-draft', isDraft: true, toRecipients: people('sender@example.test'), ccRecipients: [], bccRecipients: [] };
+    res.writeHead(req.method === 'POST' ? 201 : 200).end(JSON.stringify(stored));
+  });
+  await graph.createReplyDraft('msg', { body: 'Lieber Reto\r\n\r\nZeile eins\nZeile zwei <b>fett</b> a<b & "c"\n\n\nGruss\n\n' });
+  assert.equal(JSON.parse(requests[0].body).comment, [
+    '<div>Lieber Reto</div>', '<div><br></div>',
+    '<div>Zeile eins</div>', '<div>Zeile zwei &lt;b&gt;fett&lt;/b&gt; a&lt;b &amp; &quot;c&quot;</div>',
+    '<div><br></div>', '<div><br></div>', '<div>Gruss</div>',
+  ].join(''));
 });
 
 test('reply drafts reject HTML and invalid input before any network call and keep partial outcomes', async () => {

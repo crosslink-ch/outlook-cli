@@ -61,7 +61,7 @@ test('top-level help and capabilities advertise drafts only through the verified
   const unauthenticated = await harness().run('--help');
   assert.match(unauthenticated.text, /draft/);
   assert.doesNotMatch(unauthenticated.text, /Mail is read-only|calendar-only/i);
-  assert.equal((await harness().run('--version')).text.trim(), '0.3.0');
+  assert.equal((await harness().run('--version')).text.trim(), '0.3.1');
   const capabilities = await harness(session(grants.full)).run('capabilities', '--json');
   assert.deepEqual(capabilities.json().data.operations.slice(-4), ['draft.create', 'draft.reply', 'draft.update', 'draft.send']);
   assert.deepEqual((await harness(session(grants.calendarOnly)).run('capabilities', '--json')).json().data.operations.filter((o: string) => o.startsWith('draft')), []);
@@ -135,7 +135,7 @@ test('invalid draft arguments are INVALID_INPUT and make no network call', async
 test('real CLI entrypoint reports the new version and guards draft verbs without a session', async () => {
   const root = await mkdtemp(join(tmpdir(), 'outlook-draft-process-'));
   const invoke = (...args: string[]) => spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', ...args], { encoding: 'utf8', env: { ...process.env, XDG_CONFIG_HOME: root }, timeout: 10000 });
-  assert.equal(invoke('--version').stdout.trim(), '0.3.0');
+  assert.equal(invoke('--version').stdout.trim(), '0.3.1');
   for (const args of [['draft', 'send', '--draft', 'unused', '--json'], ['--json', 'draft', 'create', '--to', 'a@example.test', '--subject', 'S', '--body', 'x']]) {
     const rejected = invoke(...args);
     assert.equal(rejected.status, 1);

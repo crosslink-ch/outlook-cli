@@ -78,7 +78,7 @@ export function createProgram(options: ProgramOptions = {}): Command {
   const session = options.session;
   const program = new Command().name('outlook')
     .description('Outlook mail, draft and calendar CLI: authenticated read-only / read-write modes')
-    .version('0.3.0').option('--json', 'Output JSON; existing mail/auth commands retain their raw success format').exitOverride();
+    .version('0.3.1').option('--json', 'Output JSON; existing mail/auth commands retain their raw success format').exitOverride();
   program.configureOutput({ writeOut: text => io.out(text), writeErr: () => {}, outputError: () => {} });
   const emit = (value: unknown, human?: string) => {
     // Preserve the machine contract consumed by existing mail automation.

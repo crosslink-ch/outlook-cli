@@ -1,6 +1,6 @@
 {
   "name": "@crosslink-ch/outlook-cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Mode-aware Outlook mail and calendar CLI via Microsoft Graph",
   "type": "module",
   "license": "MIT",

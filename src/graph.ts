@@ -130,6 +130,11 @@ type DraftBody = { subject?: string; body?: { contentType: 'text' | 'html'; cont
 function checkBody(body: unknown): void {
   if (typeof body !== 'string' || body.length > 1_000_000) throw new CliError('INVALID_INPUT', 'Body must be text of at most 1,000,000 characters');
 }
+function textAsHtml(text: string): string {
+  const escapes: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
+  return text.replace(/(\r?\n)+$/, '').split(/\r?\n/)
+    .map(line => `<div>${line.replace(/[&<>"]/g, char => escapes[char]) || '<br>'}</div>`).join('');
+}
 function addresses(list: unknown): string[] {
   return (Array.isArray(list) ? list : []).map(item => item?.emailAddress?.address).filter(address => typeof address === 'string');
 }
@@ -275,7 +280,8 @@ export class GraphClient {
     return this.postDraft(new URL(`${GRAPH_ROOT}/me/messages`), body, body);
   }
 
-  // Graph chooses the recipients and quotes the original; the comment is plain text only.
+  // Graph chooses the recipients and quotes the original. It inserts the comment into the HTML body as markup,
+  // so the plain-text body is sent as escaped HTML with one block per line to keep its spacing and characters.
   async createReplyDraft(messageId: string, input: ReplyInput) {
     requireOperation(this.grant, 'draft.reply');
     if (!input || typeof input !== 'object' || Object.keys(input).some(key => !['all', 'body', 'html'].includes(key)) || (input.all !== undefined && typeof input.all !== 'boolean')) {
@@ -283,7 +289,7 @@ export class GraphClient {
     }
     if (input.html) throw new CliError('INVALID_INPUT', 'Reply drafts support a plain-text body only; --html is not supported for replies');
     checkBody(input.body);
-    return this.postDraft(new URL(`${GRAPH_ROOT}/me/messages/${encodedId(messageId)}/${input.all ? 'createReplyAll' : 'createReply'}`), { comment: input.body });
+    return this.postDraft(new URL(`${GRAPH_ROOT}/me/messages/${encodedId(messageId)}/${input.all ? 'createReplyAll' : 'createReply'}`), { comment: textAsHtml(input.body) });
   }
 
   private async draftPreflight(id: string, action: string): Promise<Draft> {
